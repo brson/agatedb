@@ -87,7 +87,7 @@ impl Block {
     }
 
     fn verify_checksum(&self) -> Result<()> {
-        let chksum = prost::Message::decode(self.data.clone())?;
+        let chksum = prost::Message::decode(self.checksum.clone())?;
         checksum::verify_checksum(&self.data, &chksum)
     }
 }
@@ -150,7 +150,7 @@ impl TableInner {
             opt,
         };
         inner.init_biggest_and_smallest()?;
-        // TODO: verify checksum
+        inner.verify_checksum()?;
         Ok(inner)
     }
 
@@ -170,6 +170,7 @@ impl TableInner {
             index_len: 0,
         };
         inner.init_biggest_and_smallest()?;
+        inner.verify_checksum()?;
         Ok(inner)
     }
 
@@ -361,7 +362,7 @@ impl TableInner {
         let table_index = self.fetch_index();
         for i in 0..table_index.offsets.len() {
             let block = self.block(i, true)?;
-            // TODO: table opts
+            // TODO: use table opts to determine whether to verify checksum now
             block.verify_checksum()?;
         }
         Ok(())
@@ -451,6 +452,7 @@ mod tests {
     use crate::format::{key_with_ts, user_key};
     use crate::value::Value;
     use builder::Builder;
+    use rand::prelude::*;
     use tempdir::TempDir;
 
     fn key(prefix: &[u8], i: usize) -> Bytes {
@@ -474,7 +476,15 @@ mod tests {
         }
     }
 
-    fn build_test_table(prefix: &[u8], n: usize, mut opts: Options) -> Table {
+    fn build_test_table(prefix: &[u8], n: usize, opts: Options) -> Table {
+        let tmp_dir = TempDir::new("agatedb").unwrap();
+        let filename = tmp_dir.path().join("1.sst".to_string());
+
+        let data = build_test_data(prefix, n, opts.clone());
+        Table::create(&filename, data, opts).unwrap()
+    }
+
+    fn build_test_data(prefix: &[u8], n: usize, mut opts: Options) -> Bytes {
         if opts.block_size == 0 {
             opts.block_size = 4 * 1024;
         }
@@ -488,25 +498,18 @@ mod tests {
             kv_pairs.push((k, v));
         }
 
-        build_table(kv_pairs, opts)
+        build_table_data(kv_pairs, opts)
     }
 
-    fn build_table(mut kv_pairs: Vec<(Bytes, Bytes)>, opts: Options) -> Table {
+    fn build_table_data(mut kv_pairs: Vec<(Bytes, Bytes)>, opts: Options) -> Bytes {
         let mut builder = Builder::new(opts.clone());
-        let tmp_dir = TempDir::new("agatedb").unwrap();
-        // let tmp_dir = Path::new("data/");
-        let filename = tmp_dir.path().join("1.sst".to_string());
 
         kv_pairs.sort_by(|x, y| x.0.cmp(&y.0));
 
         for (k, v) in kv_pairs {
             builder.add(&key_with_ts(&k[..], 0), Value::new_with_meta(v, b'A', 0), 0);
         }
-        let data = builder.finish();
-
-        Table::create(&filename, data, opts).unwrap()
-        // you can also test in-memory table
-        // Table::open_in_memory(data, 233, opts).unwrap()
+        builder.finish()
     }
 
     #[test]
@@ -790,5 +793,16 @@ mod tests {
         assert_eq!(n, count);
         // TODO: support max_version in table
         // assert_eq!(n, table.max_version());
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidChecksum")]
+    fn test_table_checksum() {
+        let mut rng = thread_rng();
+        let opts = get_test_table_options();
+        let mut table_data = build_test_data(b"k", 10000, opts.clone()).to_vec();
+        let start = rng.gen_range(0, table_data.len() - 100);
+        rng.fill_bytes(&mut table_data[start..start + 100]);
+        Table::open_in_memory(Bytes::from(table_data), 233, opts).unwrap();
     }
 }
