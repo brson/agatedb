@@ -1,6 +1,7 @@
 pub(crate) mod builder;
 mod iterator;
 
+use crate::bloom::Bloom;
 use crate::checksum;
 use crate::opt::Options;
 use crate::Error;
@@ -47,6 +48,7 @@ pub struct TableInner {
     index: TableIndex,
     index_start: usize,
     index_len: usize,
+    has_bloom_filter: bool,
     opt: Options,
 }
 
@@ -148,6 +150,7 @@ impl TableInner {
             index_start: 0,
             index_len: 0,
             opt,
+            has_bloom_filter: false,
         };
         inner.init_biggest_and_smallest()?;
         // TODO: verify checksum
@@ -168,6 +171,7 @@ impl TableInner {
             index: TableIndex::default(),
             index_start: 0,
             index_len: 0,
+            has_bloom_filter: false,
         };
         inner.init_biggest_and_smallest()?;
         Ok(inner)
@@ -222,7 +226,8 @@ impl TableInner {
         // TODO: compression
         self.estimated_size = self.table_size as u32;
 
-        // TODO: has bloom filter
+        // bloom filter
+        self.has_bloom_filter = self.index.bloom_filter.len() > 0;
 
         Ok(&self.index.offsets[0])
     }
@@ -341,13 +346,18 @@ impl TableInner {
         self.id
     }
 
-    pub fn does_not_have(_hash: u32) -> bool {
-        false
-        // TODO: add bloom filter
+    pub fn does_not_have(&self, hash: u32) -> bool {
+        if self.has_bloom_filter {
+            let index = self.fetch_index();
+            let bloom = Bloom::new(&index.bloom_filter);
+            !bloom.may_contain(hash)
+        } else {
+            false
+        }
     }
 
-    fn read_bloom_filter(&self) {
-        unimplemented!()
+    pub fn has_bloom_filter(&self) -> bool {
+        self.has_bloom_filter
     }
 
     pub(crate) fn read_table_index(&self) -> Result<TableIndex> {
@@ -443,38 +453,33 @@ impl Table {
     pub fn max_version(&self) -> u64 {
         self.inner.max_version()
     }
+
+    pub fn has_bloom_filter(&self) -> bool {
+        self.inner.has_bloom_filter()
+    }
+
+    pub fn does_not_have(&self, hash: u32) -> bool {
+        self.inner.does_not_have(hash)
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub mod test_utils {
     use super::*;
-    use crate::format::{key_with_ts, user_key};
+    use crate::format::key_with_ts;
     use crate::value::Value;
     use builder::Builder;
     use tempdir::TempDir;
 
-    fn key(prefix: &[u8], i: usize) -> Bytes {
+    pub fn key(prefix: &[u8], i: usize) -> Bytes {
         Bytes::from([prefix, format!("{:04}", i).as_bytes()].concat())
     }
 
-    fn key_isize(prefix: &[u8], i: isize) -> Bytes {
+    pub fn key_isize(prefix: &[u8], i: isize) -> Bytes {
         Bytes::from([prefix, format!("{:04}", i).as_bytes()].concat())
     }
 
-    #[test]
-    fn test_generate_key() {
-        assert_eq!(key(b"key", 233), Bytes::from("key0233"));
-    }
-
-    fn get_test_table_options() -> Options {
-        Options {
-            block_size: 4 * 1024,
-            table_size: 0,
-            bloom_false_positive: 0.01,
-        }
-    }
-
-    fn build_test_table(prefix: &[u8], n: usize, mut opts: Options) -> Table {
+    pub fn build_test_table(prefix: &[u8], n: usize, mut opts: Options) -> Table {
         if opts.block_size == 0 {
             opts.block_size = 4 * 1024;
         }
@@ -491,7 +496,7 @@ mod tests {
         build_table(kv_pairs, opts)
     }
 
-    fn build_table(mut kv_pairs: Vec<(Bytes, Bytes)>, opts: Options) -> Table {
+    pub fn build_table(mut kv_pairs: Vec<(Bytes, Bytes)>, opts: Options) -> Table {
         let mut builder = Builder::new(opts.clone());
         let tmp_dir = TempDir::new("agatedb").unwrap();
         // let tmp_dir = Path::new("data/");
@@ -507,6 +512,29 @@ mod tests {
         Table::create(&filename, data, opts).unwrap()
         // you can also test in-memory table
         // Table::open_in_memory(data, 233, opts).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{key_with_ts, user_key};
+    use crate::value::Value;
+    use builder::Builder;
+    use tempdir::TempDir;
+    use test_utils::*;
+
+    #[test]
+    fn test_generate_key() {
+        assert_eq!(key(b"key", 233), Bytes::from("key0233"));
+    }
+
+    fn get_test_table_options() -> Options {
+        Options {
+            block_size: 4 * 1024,
+            table_size: 0,
+            bloom_false_positive: 0.01,
+        }
     }
 
     #[test]
